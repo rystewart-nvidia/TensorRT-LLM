@@ -6,7 +6,7 @@
 This directory checkpoints the experimental scripts and reports used for static
 batching, offset FA4 attention, and step-level continuous batching on one B200.
 It is not a supported serving API or a CI-registered benchmark. Reports retain
-historical decisions and failures; efficiency-run-record.md is the latest result.
+historical decisions and failures; attention-run-record.md is the latest result.
 
 The scripts retain their original container layout to preserve reproducibility:
 
@@ -40,3 +40,10 @@ with focused tests, a compiled-reference probe, a dispatch-verified full-pipelin
 benchmark, and media/velocity diagnostics. It measured about 4% additional
 throughput but has unresolved full-transformer numerical differences. It is
 not enabled by default; read efficiency-run-record.md before using it.
+
+The attention-only follow-up sweeps the pinned FA4 tile/CTA configurations and
+tests generation-scoped metadata reuse plus a compile-compatible custom-op
+boundary. It leaves the Q/K fusion off and preserves BF16 attention. The new
+adapter and its tests remain local/QA only; they are not production defaults.
+Read attention-run-record.md for the interrupted attempt, corrected warmup
+dispatch check, excluded measurement, full-pipeline results, and media paths.
