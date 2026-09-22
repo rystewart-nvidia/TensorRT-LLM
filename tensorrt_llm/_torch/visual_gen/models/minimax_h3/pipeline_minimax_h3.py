@@ -93,7 +93,9 @@ def _check_denoise_step(velocity: torch.Tensor, name: str, step: int) -> None:
     """
     # Reduce both conditions on device and read them back together, so the
     # check costs one sync per call rather than one per condition.
-    finite, nonzero = torch.stack([torch.isfinite(velocity).all(), velocity.any()]).tolist()
+    finite, nonzero = torch.stack(
+        [torch.isfinite(velocity).all(), velocity.flatten(1).any(dim=1).all()]
+    ).tolist()
     if not finite:
         raise RuntimeError(
             f"MiniMax-H3 {name} velocity is not finite at denoising step {step}; "
@@ -360,13 +362,12 @@ class MiniMaxH3Pipeline(BasePipeline):
                 "MiniMax-H3 is guidance-distilled and does not accept negative_prompt."
             )
         if req.params.num_images_per_prompt != 1:
-            raise ValueError("MiniMax-H3 initial support generates one video per request.")
-
-        prompt = req.prompt
-        if isinstance(prompt, list):
-            if len(prompt) != 1:
-                raise ValueError("MiniMax-H3 initial support accepts one prompt per request.")
-            prompt = prompt[0]
+            raise ValueError(
+                "MiniMax-H3 generates one video per prompt; repeat the prompt in a list "
+                "to generate multiple videos."
+            )
+        prompts = req.prompt if isinstance(req.prompt, list) else [req.prompt]
+        prompt = prompts[0] if len(prompts) == 1 else prompts
 
         prepared_inputs = getattr(req, "prepared_inputs", {})
         keyframes = prepared_inputs.get("keyframes")
@@ -388,14 +389,15 @@ class MiniMaxH3Pipeline(BasePipeline):
 
     def _validate_request(
         self,
-        prompt: str,
+        prompt: str | list[str],
         height: int,
         width: int,
         num_frames: int,
         frame_rate: float,
     ) -> int:
-        if not isinstance(prompt, str):
-            raise ValueError("MiniMax-H3 accepts one prompt string per request.")
+        prompts = prompt if isinstance(prompt, list) else [prompt]
+        if not prompts or any(not isinstance(item, str) or not item for item in prompts):
+            raise ValueError("MiniMax-H3 requires a non-empty prompt string or list of strings.")
         if frame_rate != MINIMAX_H3_FPS:
             raise ValueError(f"MiniMax-H3 uses a fixed {MINIMAX_H3_FPS} fps, got {frame_rate}.")
         self.validate_resolution(height, width, num_frames)
@@ -508,6 +510,32 @@ class MiniMaxH3Pipeline(BasePipeline):
         )
         return prompt_embeds, torch.tensor(token_tags, dtype=torch.long)
 
+    def _encode_prompts(
+        self, prompts: list[str], keyframes: list[Image.Image]
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        encoded = [self._encode_prompt(prompt, keyframes) for prompt in prompts]
+        lengths = [embeds.shape[1] for embeds, _ in encoded]
+        if not all(lengths):
+            raise ValueError("MiniMax-H3 prompts must contain at least one token.")
+        max_length = max(lengths)
+        text_attention_mask = None
+        if min(lengths) != max_length:
+            # Left padding shifts every real text/audio/video time coordinate by
+            # the same amount, preserving H3's relative RoPE positions.
+            text_attention_mask = torch.arange(max_length, device=self.device)[None] >= (
+                max_length - torch.tensor(lengths, device=self.device)[:, None]
+            )
+        prompt_embeds = torch.cat(
+            [
+                torch.cat(
+                    (embeds.new_zeros(1, max_length - length, embeds.shape[-1]), embeds), dim=1
+                )
+                for (embeds, _), length in zip(encoded, lengths)
+            ]
+        )
+        text_token_tags = encoded[lengths.index(max_length)][1]
+        return prompt_embeds, text_token_tags, text_attention_mask
+
     def _encode_keyframes(
         self,
         keyframes: list[Image.Image],
@@ -599,8 +627,10 @@ class MiniMaxH3Pipeline(BasePipeline):
         latent_height: int,
         latent_width: int,
     ) -> torch.Tensor:
+        if rows.ndim == 2:
+            rows = rows.unsqueeze(0)
         latents = unpatchify_video_tokens(
-            rows[num_condition_rows:],
+            rows[:, num_condition_rows:].flatten(0, 1),
             num_latent_frames,
             latent_height,
             latent_width,
@@ -632,6 +662,9 @@ class MiniMaxH3Pipeline(BasePipeline):
         rows: torch.Tensor,
         num_audio_latents: int,
     ) -> torch.Tensor:
+        if rows.ndim == 2:
+            rows = rows.unsqueeze(0)
+        batch_size = rows.shape[0]
         latents = unpack_audio_tokens(rows, num_audio_latents)
         latents_mean = torch.tensor(
             self.audio_vae.config.latents_mean,
@@ -645,13 +678,13 @@ class MiniMaxH3Pipeline(BasePipeline):
             latents * latents_std + latents_mean,
             return_dict=False,
         )[0]
-        return audio.float().permute(1, 0, 2)
+        return audio.float().reshape(batch_size, MINIMAX_H3_AUDIO_CHANNELS, -1)
 
     @torch.inference_mode()
     def forward(
         self,
         *,
-        prompt: str,
+        prompt: str | list[str],
         seed: int,
         height: int,
         width: int,
@@ -661,6 +694,11 @@ class MiniMaxH3Pipeline(BasePipeline):
         keyframes: Optional[list[Image.Image]] = None,
         keyframe_anchors: Optional[tuple[str, ...]] = None,
     ) -> PipelineOutput:
+        """Generate a static batch with shared settings and per-sample ``seed + index``.
+
+        Text encoding is per prompt; refinement, joint denoising, and decoding
+        retain the batch dimension. Keyframe conditioning is single-sample only.
+        """
         pipeline_start = time.time()
         timer = CudaPhaseTimer()
         timer.mark_pre_start()
@@ -673,6 +711,9 @@ class MiniMaxH3Pipeline(BasePipeline):
             num_frames,
             frame_rate,
         )
+        prompts = prompt if isinstance(prompt, list) else [prompt]
+        if len(prompts) > 1 and (keyframes or keyframe_anchors):
+            raise ValueError("MiniMax-H3 batching currently supports text-to-video only.")
         if keyframe_anchors is None:
             keyframe_anchors = ("first", "last")[: len(keyframes)]
         keyframes = self._prepare_keyframes(
@@ -681,13 +722,14 @@ class MiniMaxH3Pipeline(BasePipeline):
             height,
             width,
         )
-        generator = self._request_generator(seed)
         num_latent_frames = video_latent_num_frames(num_frames)
         latent_height = height // self.vae.spatial_compression_ratio
         latent_width = width // self.vae.spatial_compression_ratio
         num_audio_latents = audio_latent_num_frames(num_frames)
 
-        prompt_embeds, text_token_tags = self._encode_prompt(prompt, keyframes)
+        prompt_embeds, text_token_tags, text_attention_mask = self._encode_prompts(
+            prompts, keyframes
+        )
         layout = build_packed_sequence(
             text_token_tags,
             num_latent_frames,
@@ -703,20 +745,23 @@ class MiniMaxH3Pipeline(BasePipeline):
         audio_indices = layout.audio_indices.to(self.device)
         text_indices = layout.text_indices.to(self.device)
 
-        condition_latents = self._encode_keyframes(
-            keyframes,
-            latent_height,
-            latent_width,
-            generator,
-        )
-        latents, audio_latents = self._prepare_latents(
-            num_latent_frames=num_latent_frames,
-            latent_height=latent_height,
-            latent_width=latent_width,
-            num_audio_latents=num_audio_latents,
-            generator=generator,
-            condition_latents=condition_latents,
-        )
+        video_batch, audio_batch = [], []
+        for index in range(len(prompts)):
+            generator = self._request_generator(seed + index)
+            condition_latents = self._encode_keyframes(
+                keyframes, latent_height, latent_width, generator
+            )
+            video_rows, audio_rows = self._prepare_latents(
+                num_latent_frames=num_latent_frames,
+                latent_height=latent_height,
+                latent_width=latent_width,
+                num_audio_latents=num_audio_latents,
+                generator=generator,
+                condition_latents=condition_latents,
+            )
+            video_batch.append(video_rows)
+            audio_batch.append(audio_rows)
+        latents, audio_latents = torch.stack(video_batch), torch.stack(audio_batch)
 
         self.scheduler.set_timesteps(num_inference_steps, device=self.device)
         self.audio_scheduler.set_timesteps(num_inference_steps, device=self.device)
@@ -748,9 +793,10 @@ class MiniMaxH3Pipeline(BasePipeline):
         static_context = self.transformer.prepare_static_context(
             prompt_embeds,
             position_ids,
+            text_attention_mask=text_attention_mask,
         )
         condition_rows = layout.num_condition_video_rows
-        condition_prefix = latents[:condition_rows][None]
+        condition_prefix = latents[:, :condition_rows]
         # H3's native time increases toward clean. Attention and graph-phase
         # scheduling use descending normalized noise, protecting both streams.
         attention_timesteps = 1.0 - torch.minimum(
@@ -793,16 +839,16 @@ class MiniMaxH3Pipeline(BasePipeline):
 
         timer.mark_denoise_start()
         generated_latents, extra_latents = self.denoise(
-            latents=latents[condition_rows:][None],
+            latents=latents[:, condition_rows:],
             scheduler=self.scheduler,
             prompt_embeds=prompt_embeds,
             guidance_scale=1.0,
             forward_fn=forward_fn,
-            extra_streams={"audio": (audio_latents[None], self.audio_scheduler)},
+            extra_streams={"audio": (audio_latents, self.audio_scheduler)},
             extra_stream_timesteps={"audio": self.audio_scheduler.timesteps},
         )
-        latents = torch.cat((condition_prefix, generated_latents), dim=1)[0]
-        audio_latents = extra_latents["audio"][0]
+        latents = torch.cat((condition_prefix, generated_latents), dim=1)
+        audio_latents = extra_latents["audio"]
         timer.mark_post_start()
         video = self._decode_video(
             latents,

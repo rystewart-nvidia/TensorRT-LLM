@@ -211,6 +211,23 @@ def test_unpack_audio_tokens_restores_stereo_batch() -> None:
     torch.testing.assert_close(audio[1, :, 0], rows[5])
 
 
+def test_unpack_audio_tokens_preserves_sample_and_stereo_order() -> None:
+    rows = torch.arange(4 * 2 * 5 * 3, dtype=torch.float32).reshape(4, 10, 3)
+    audio = unpack_audio_tokens(rows, num_audio_latents=5)
+    assert audio.shape == (8, 3, 5)
+    for sample in range(4):
+        for channel in range(2):
+            torch.testing.assert_close(
+                audio[2 * sample + channel], rows[sample, channel * 5 : (channel + 1) * 5].T
+            )
+
+
+@pytest.mark.parametrize("shape", [(2, 9, 3), (9, 3), (2, 2, 10, 3)])
+def test_unpack_audio_tokens_rejects_malformed_batch(shape: tuple[int, ...]) -> None:
+    with pytest.raises(ValueError, match="audio rows per sample"):
+        unpack_audio_tokens(torch.zeros(shape), num_audio_latents=5)
+
+
 def test_build_packed_sequence_places_modalities_and_keyframe_anchors() -> None:
     text_tags = torch.tensor([MINIMAX_H3_TEXT_TAG, MINIMAX_H3_VIDEO_TAG, MINIMAX_H3_TEXT_TAG])
 
