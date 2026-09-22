@@ -24,7 +24,8 @@ from tensorrt_llm._torch.visual_gen.models.minimax_h3 import transformer_minimax
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 
-def test_masked_batch_matches_independent_transformer_samples() -> None:
+@pytest.mark.parametrize("mixed_timesteps", [False, True])
+def test_masked_batch_matches_independent_transformer_samples(mixed_timesteps: bool) -> None:
     torch.manual_seed(11)
     model = (
         h3.MiniMaxH3Transformer3DModel(_make_model_config(num_layers=2, num_refiner_layers=2))
@@ -46,6 +47,8 @@ def test_masked_batch_matches_independent_transformer_samples() -> None:
         audio_indices=torch.tensor([4], device="cuda"),
     )
     mask = torch.tensor([[False, False, True], [True, True, True]], device="cuda")
+    if mixed_timesteps:
+        long["conditioning_timesteps"] = torch.tensor([0.2, 0.7], device="cuda")
     padded_short = torch.cat(
         (torch.full((1, 2, 5), 100.0, device="cuda"), short["encoder_hidden_states"]), dim=1
     )
@@ -62,6 +65,13 @@ def test_masked_batch_matches_independent_transformer_samples() -> None:
             "position_ids": None,
             "static_context": context,
         }
+        if mixed_timesteps:
+            batched["conditioning_timesteps"] = torch.cat(
+                (short["conditioning_timesteps"], long["conditioning_timesteps"])
+            )
+            batched["timestep_indices"] = torch.stack(
+                (long["timestep_indices"], long["timestep_indices"] + 2)
+            )
         actual = model(**batched)
         for index, reference in enumerate(expected):
             torch.testing.assert_close(
@@ -81,6 +91,21 @@ def test_masked_batch_matches_independent_transformer_samples() -> None:
         torch.testing.assert_close(changed.sample[0], actual.sample[0], rtol=0, atol=0)
         torch.testing.assert_close(changed.audio_sample[0], actual.audio_sample[0], rtol=0, atol=0)
         assert not torch.equal(changed.sample[1], actual.sample[1])
+
+
+@pytest.mark.parametrize("cached_context", [False, True])
+def test_request_local_timestep_indices_validate_batch_size(cached_context: bool) -> None:
+    model = h3.MiniMaxH3Transformer3DModel(_make_model_config()).to("cuda").eval()
+    _initialize_weights(model)
+    inputs = _model_inputs("cuda")
+    if cached_context:
+        inputs["static_context"] = model.prepare_static_context(
+            inputs["encoder_hidden_states"], inputs["position_ids"]
+        )
+        inputs["position_ids"] = None
+    inputs["timestep_indices"] = inputs["timestep_indices"].expand(2, -1)
+    with pytest.raises(ValueError, match="shape \\[S\\] or \\[B, S\\]"):
+        model(**inputs)
 
 
 def test_padded_text_rejects_backend_without_mask_support() -> None:

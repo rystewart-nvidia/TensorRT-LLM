@@ -190,6 +190,11 @@ def _norm_2d(norm: RMSNorm, hidden_states: torch.Tensor) -> torch.Tensor:
     return norm(hidden_states.reshape(-1, shape[-1])).view(shape)
 
 
+def _select_conditioning(table: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
+    """Gather shared [S] or request-local [B, S] conditioning from one table."""
+    return table.index_select(0, indices.reshape(-1)).reshape(*indices.shape, table.shape[-1])
+
+
 class MiniMaxH3AdaLayerNormModulation(nn.Module):
     """Produce six AdaLN vectors for every ``(timestep, modality)`` pair."""
 
@@ -252,9 +257,9 @@ class MiniMaxH3AdaLayerNormOut(nn.Module):
     ) -> torch.Tensor:
         shift, scale = self.linear(F.silu(temb).to(self.linear.dtype)).chunk(2, dim=-1)
         hidden_states = _norm_2d(self.norm, hidden_states)
-        return hidden_states * (1.0 + scale.index_select(0, timestep_indices)) + shift.index_select(
-            0, timestep_indices
-        )
+        return hidden_states * (
+            1.0 + _select_conditioning(scale, timestep_indices)
+        ) + _select_conditioning(shift, timestep_indices)
 
 
 class MiniMaxH3TokenRefinerBlock(nn.Module):
@@ -414,9 +419,9 @@ class MiniMaxH3TransformerBlock(nn.Module):
         residual = hidden_states
         norm_hidden_states = _norm_2d(self.norm1, hidden_states)
         norm_hidden_states = norm_hidden_states * (
-            1.0 + scale_msa.index_select(0, adaln_indices)
-        ) + shift_msa.index_select(0, adaln_indices)
-        hidden_states = residual + gate_msa.index_select(0, adaln_indices) * self.attn(
+            1.0 + _select_conditioning(scale_msa, adaln_indices)
+        ) + _select_conditioning(shift_msa, adaln_indices)
+        hidden_states = residual + _select_conditioning(gate_msa, adaln_indices) * self.attn(
             norm_hidden_states,
             rotary_emb,
             key_padding_mask,
@@ -426,12 +431,12 @@ class MiniMaxH3TransformerBlock(nn.Module):
         residual = hidden_states
         norm_hidden_states = _norm_2d(self.norm2, hidden_states)
         norm_hidden_states = norm_hidden_states * (
-            1.0 + scale_mlp.index_select(0, adaln_indices)
-        ) + shift_mlp.index_select(0, adaln_indices)
+            1.0 + _select_conditioning(scale_mlp, adaln_indices)
+        ) + _select_conditioning(shift_mlp, adaln_indices)
         ff_output = self.ff(
             norm_hidden_states.reshape(-1, norm_hidden_states.shape[-1])
         ).reshape_as(norm_hidden_states)
-        return residual + gate_mlp.index_select(0, adaln_indices) * ff_output
+        return residual + _select_conditioning(gate_mlp, adaln_indices) * ff_output
 
 
 class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
@@ -683,7 +688,11 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
                 f"position_ids must have shape [sequence_length, 3], got {list(position_ids.shape)}."
             )
         sequence_length = position_ids.shape[0]
-        if token_tags.shape != (sequence_length,) or timestep_indices.shape != (sequence_length,):
+        if (
+            token_tags.shape != (sequence_length,)
+            or timestep_indices.ndim not in (1, 2)
+            or timestep_indices.shape[-1] != sequence_length
+        ):
             raise ValueError(
                 "token_tags and timestep_indices must match the packed sequence length."
             )
@@ -717,6 +726,8 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
 
         ``conditioning_timesteps`` is the unique H3 time table for AdaLN;
         ``timestep`` is descending noise in [0, 1] for attention/graph scheduling.
+        ``timestep_indices`` maps shared [S] or request-local [B, S] rows into
+        the conditioning table, allowing different denoising progress per sample.
         """
         del attention_kwargs
         if position_ids is None:
@@ -738,10 +749,16 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
                 encoder_hidden_states,
                 position_ids,
             )
-        elif token_tags.shape != (sequence_length,) or timestep_indices.shape != (sequence_length,):
+        elif token_tags.shape != (sequence_length,):
             raise ValueError(
                 "token_tags and timestep_indices must match the cached packed sequence length."
             )
+
+        if timestep_indices.shape not in (
+            (sequence_length,),
+            (hidden_states.shape[0], sequence_length),
+        ):
+            raise ValueError("timestep_indices must have shape [S] or [B, S].")
 
         if static_context.sequence_length != sequence_length:
             raise ValueError("static_context RoPE length must match the packed sequence length.")
