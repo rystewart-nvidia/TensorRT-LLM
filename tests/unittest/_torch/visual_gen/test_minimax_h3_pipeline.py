@@ -50,6 +50,8 @@ class _FakeMiniMaxH3Transformer:
         self.forward_calls = 0
         self.inference_modes: list[bool] = []
         self.attention_timesteps: list[torch.Tensor] = []
+        self.batch_sizes: list[int] = []
+        self.text_attention_mask: torch.Tensor | None = None
 
     def eval(self) -> "_FakeMiniMaxH3Transformer":
         self.training = False
@@ -59,8 +61,10 @@ class _FakeMiniMaxH3Transformer:
         self,
         prompt_embeds: torch.Tensor,
         position_ids: torch.Tensor,
+        text_attention_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         self.static_context_calls += 1
+        self.text_attention_mask = text_attention_mask
         return prompt_embeds, position_ids
 
     def __call__(
@@ -74,6 +78,7 @@ class _FakeMiniMaxH3Transformer:
         self.attention_timesteps.append(kwargs["timestep"].clone())
         assert static_context is not None
         self.forward_calls += 1
+        self.batch_sizes.append(hidden_states.shape[0])
         self.inference_modes.append(torch.is_inference_mode_enabled())
         # Non-zero: an all-zero velocity is what _check_denoise_step treats
         # as a corrupt step, so a fake must not emit one.
@@ -125,12 +130,11 @@ class _SyntheticMiniMaxH3Pipeline(MiniMaxH3Pipeline):
         latent_height: int,
         latent_width: int,
     ) -> torch.Tensor:
-        del rows, num_condition_rows, num_latent_frames, latent_height, latent_width
-        return torch.zeros(1, 124, 32, 32, 3, dtype=torch.uint8)
+        del num_condition_rows, num_latent_frames, latent_height, latent_width
+        return torch.zeros(rows.shape[0], 124, 32, 32, 3, dtype=torch.uint8)
 
     def _decode_audio(self, rows: torch.Tensor, num_audio_latents: int) -> torch.Tensor:
-        del rows
-        return torch.zeros(1, 2, num_audio_latents * 800)
+        return torch.zeros(rows.shape[0], 2, num_audio_latents * 800)
 
 
 def test_pipeline_reuses_static_context_across_joint_denoise_steps() -> None:
@@ -195,6 +199,102 @@ def test_pipeline_runs_generation_in_inference_mode() -> None:
     )
 
     assert pipeline.transformer.inference_modes == [True]
+
+
+@pytest.mark.parametrize("batch_size", [2, 4])
+def test_static_batch_shares_denoising_steps(batch_size: int) -> None:
+    pipeline = _SyntheticMiniMaxH3Pipeline()
+    output = pipeline.forward(
+        prompt=["test"] * batch_size,
+        seed=42,
+        height=32,
+        width=32,
+        num_frames=124,
+        frame_rate=24.0,
+        num_inference_steps=4,
+    )
+    assert pipeline.transformer.batch_sizes == [batch_size] * 3
+    assert pipeline.transformer.static_context_calls == 1
+    assert output.video.shape == (batch_size, 124, 32, 32, 3)
+    assert output.audio.shape[:2] == (batch_size, 2)
+
+
+def test_prompt_batch_left_pads_and_masks_variable_lengths(monkeypatch: pytest.MonkeyPatch) -> None:
+    pipeline = _SyntheticMiniMaxH3Pipeline()
+
+    def encode(prompt: str, keyframes: list[Image.Image]) -> tuple[torch.Tensor, torch.Tensor]:
+        del keyframes
+        return torch.full((1, len(prompt), 4), len(prompt)), torch.ones(
+            len(prompt), dtype=torch.long
+        )
+
+    monkeypatch.setattr(pipeline, "_encode_prompt", encode)
+    embeds, tags, mask = pipeline._encode_prompts(["a", "abcd"], [])
+    assert embeds.shape == (2, 4, 4)
+    assert tags.tolist() == [MINIMAX_H3_TEXT_TAG] * 4
+    assert mask.tolist() == [[False, False, False, True], [True, True, True, True]]
+    assert not embeds[0, :3].any()
+    assert (embeds[0, 3] == 1).all()
+    assert (embeds[1] == 4).all()
+
+
+def test_batched_latents_preserve_each_sample_seed(monkeypatch: pytest.MonkeyPatch) -> None:
+    pipeline = _SyntheticMiniMaxH3Pipeline()
+    captured: list[tuple[torch.Tensor, torch.Tensor]] = []
+
+    def capture_denoise(**kwargs: object) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        video = kwargs["latents"]
+        audio = kwargs["extra_streams"]["audio"][0]
+        captured.append((video.clone(), audio.clone()))
+        return video, {"audio": audio}
+
+    monkeypatch.setattr(pipeline, "denoise", capture_denoise)
+    settings = dict(height=32, width=32, num_frames=124, frame_rate=24.0, num_inference_steps=2)
+    pipeline.forward(prompt=["first", "second"], seed=42, **settings)
+    pipeline.forward(prompt="second", seed=43, **settings)
+    for batched, single in zip(captured[0], captured[1]):
+        torch.testing.assert_close(batched[1:2], single, rtol=0, atol=0)
+        assert not torch.equal(batched[0], batched[1])
+
+
+@pytest.mark.parametrize("prompt", [[], ["valid", 3], None])
+def test_batch_rejects_invalid_prompts(prompt: str | list[str]) -> None:
+    with pytest.raises(ValueError, match="non-empty list"):
+        _SyntheticMiniMaxH3Pipeline().forward(
+            prompt=prompt,
+            seed=0,
+            height=32,
+            width=32,
+            num_frames=124,
+            frame_rate=24.0,
+            num_inference_steps=2,
+        )
+
+
+@pytest.mark.parametrize("prompt", ["", [""], ["valid", ""]])
+def test_request_validation_does_not_reject_empty_strings(prompt: str | list[str]) -> None:
+    assert _SyntheticMiniMaxH3Pipeline()._validate_request(prompt, 32, 32, 124, 24.0) == 124
+
+
+def test_batch_rejects_keyframe_conditioning() -> None:
+    with pytest.raises(ValueError, match="text-to-video only"):
+        _SyntheticMiniMaxH3Pipeline().forward(
+            prompt=["first", "second"],
+            seed=0,
+            height=32,
+            width=32,
+            num_frames=124,
+            frame_rate=24.0,
+            num_inference_steps=2,
+            keyframes=[Image.new("RGB", (32, 32))],
+        )
+
+
+def test_one_zero_velocity_sample_cannot_hide_in_a_batch() -> None:
+    with pytest.raises(RuntimeError, match="all zeros"):
+        h3_pipeline._check_denoise_step(
+            torch.stack((torch.ones(4, 2), torch.zeros(4, 2))), "video", 0
+        )
 
 
 @pytest.mark.parametrize("override", [False, True])
@@ -554,7 +654,8 @@ def test_infer_supports_a_last_frame_without_a_first_frame(
     assert captured["keyframe_anchors"] == ("last",)
 
 
-def test_infer_unwraps_the_executor_single_prompt_list() -> None:
+@pytest.mark.parametrize("prompts", [["one public API prompt"], ["first", "second"]])
+def test_infer_preserves_the_executor_prompt_batch(prompts: list[str]) -> None:
     pipeline = _SyntheticMiniMaxH3Pipeline()
     captured: dict[str, object] = {}
 
@@ -564,7 +665,7 @@ def test_infer_unwraps_the_executor_single_prompt_list() -> None:
 
     pipeline.forward = _capture_forward
     request = SimpleNamespace(
-        prompt=["one public API prompt"],
+        prompt=prompts,
         prepared_inputs={"keyframes": [], "keyframe_anchors": ()},
         params=SimpleNamespace(
             negative_prompt=None,
@@ -581,7 +682,34 @@ def test_infer_unwraps_the_executor_single_prompt_list() -> None:
     )
 
     assert pipeline.infer(request) == "output"
-    assert captured["prompt"] == "one public API prompt"
+    assert captured["prompt"] == (prompts[0] if len(prompts) == 1 else prompts)
+
+
+def test_batched_audio_decode_preserves_samples_and_channels() -> None:
+    pipeline = _SyntheticMiniMaxH3Pipeline()
+    pipeline.audio_vae = SimpleNamespace(
+        config=SimpleNamespace(latents_mean=[0.0], latents_std=[1.0]),
+        decode=lambda latents, return_dict: (latents,),
+    )
+    rows = torch.arange(2 * 2 * 5, dtype=torch.float32).reshape(2, 10, 1)
+    audio = MiniMaxH3Pipeline._decode_audio(pipeline, rows, 5)
+    assert audio.shape == (2, 2, 5)
+    torch.testing.assert_close(audio, rows.reshape(2, 2, 5))
+
+
+def test_batched_video_decode_drops_each_samples_condition_rows() -> None:
+    pipeline = _SyntheticMiniMaxH3Pipeline()
+    pipeline.vae = SimpleNamespace(
+        config=SimpleNamespace(latent_channels=3, latents_mean=[0.0] * 3, latents_std=[1.0] * 3),
+        decode=lambda latents, return_dict: (latents,),
+    )
+    rows = torch.zeros(2, 2, 12)
+    rows[:, 0] = float("nan")
+    rows[1, 1] = 1.0
+    video = MiniMaxH3Pipeline._decode_video(pipeline, rows, 1, 1, 2, 2)
+    assert video.shape == (2, 1, 2, 2, 3)
+    assert video.dtype == torch.uint8
+    assert (video[1] > video[0]).all()
 
 
 def test_prepare_request_derives_default_canvas_from_last_only_keyframe(

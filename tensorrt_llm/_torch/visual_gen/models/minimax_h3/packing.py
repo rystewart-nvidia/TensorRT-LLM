@@ -209,11 +209,13 @@ def unpatchify_video_tokens(
 
 
 def unpack_audio_tokens(rows: torch.Tensor, num_audio_latents: int) -> torch.Tensor:
-    """Unpack channel-major audio rows to ``[2, channels, audio_frames]``."""
+    """Unpack ``[B, 2*T, C]`` (or ``[2*T, C]``) to ``[B*2, C, T]``."""
     expected_rows = MINIMAX_H3_AUDIO_CHANNELS * num_audio_latents
-    if rows.shape[0] != expected_rows:
-        raise ValueError(f"Expected {expected_rows} audio rows, got {rows.shape[0]}.")
-    rows = rows.reshape(MINIMAX_H3_AUDIO_CHANNELS, num_audio_latents, rows.shape[-1])
+    if rows.ndim not in (2, 3) or rows.shape[-2] != expected_rows:
+        raise ValueError(
+            f"Expected {expected_rows} audio rows per sample, got shape {list(rows.shape)}."
+        )
+    rows = rows.reshape(-1, num_audio_latents, rows.shape[-1])
     return rows.permute(0, 2, 1).contiguous()
 
 

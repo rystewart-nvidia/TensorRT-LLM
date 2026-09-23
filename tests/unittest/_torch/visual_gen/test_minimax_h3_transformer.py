@@ -712,8 +712,9 @@ def test_forward_builds_timestep_modality_adaln_indices() -> None:
             rotary_emb: tuple[torch.Tensor, torch.Tensor],
             key_padding_mask: torch.Tensor | None,
             timestep: torch.Tensor,
+            suffix_mask: bool = False,
         ) -> torch.Tensor:
-            del temb, rotary_emb, key_padding_mask
+            del temb, rotary_emb, key_padding_mask, suffix_mask
             self.adaln_indices = adaln_indices.clone()
             self.attention_timestep = timestep.clone()
             return hidden_states
@@ -826,6 +827,18 @@ def test_key_padding_mask_support_tracks_attention_backend(backend: str, support
     model = h3.MiniMaxH3Transformer3DModel(config)
 
     assert model._supports_key_padding_mask is supported
+
+
+@requires_cuda
+@pytest.mark.parametrize("backend", ["VANILLA", "FA4", "TRTLLM", "CUTEDSL"])
+def test_h3_batch_optimization_preserves_other_backend_selections(backend: str) -> None:
+    config = _make_model_config(num_layers=1, attention_head_dim=128)
+    config.attention = AttentionConfig(backend=backend)
+    config.attention_metadata_state = create_attention_metadata_state()
+    model = h3.MiniMaxH3Transformer3DModel(config)
+    assert isinstance(model.transformer_blocks[0].attn.attn, h3.MiniMaxH3BatchedAttention) is (
+        backend == "VANILLA"
+    )
 
 
 @requires_cuda

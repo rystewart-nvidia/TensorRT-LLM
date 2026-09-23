@@ -35,12 +35,15 @@ from tensorrt_llm._torch.models.hf_parameter_utils import get_parameter_device
 from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
+from tensorrt_llm._torch.visual_gen.attention_backend.vanilla import VanillaAttention
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
 from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
+
+from .attention import MiniMaxH3BatchedAttention, is_nonempty_suffix_mask
 
 MINIMAX_H3_MODALITY_NUM = 3
 
@@ -59,6 +62,7 @@ class MiniMaxH3StaticContext:
 
     text_embeds: torch.Tensor
     rotary_emb: tuple[torch.Tensor, torch.Tensor]
+    text_attention_mask: torch.Tensor | None = None
 
     @property
     def sequence_length(self) -> int:
@@ -144,6 +148,14 @@ class MiniMaxH3Attention(Attention):
             layer_idx=layer_idx,
             module_name=module_name,
         )
+        if type(self.attn) is VanillaAttention and model_config.mapping.world_size == 1:
+            self.attn = MiniMaxH3BatchedAttention(
+                layer_idx=layer_idx,
+                num_heads=self.local_num_attention_heads,
+                head_dim=self.head_dim,
+                num_kv_heads=self.local_num_key_value_heads,
+                dtype=self.dtype,
+            )
 
     def forward(
         self,
@@ -151,6 +163,7 @@ class MiniMaxH3Attention(Attention):
         rotary_emb: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
         key_padding_mask: Optional[torch.Tensor] = None,
         timestep: Optional[torch.Tensor] = None,
+        suffix_mask: bool = False,
     ) -> torch.Tensor:
         batch_size, sequence_length = hidden_states.shape[:2]
         query, key, value = self.get_qkv(hidden_states)
@@ -172,6 +185,7 @@ class MiniMaxH3Attention(Attention):
             value,
             key_padding_mask=key_padding_mask,
             timestep=timestep,
+            suffix_mask=suffix_mask,
         )
         return self.to_out[0](hidden_states)
 
@@ -295,8 +309,17 @@ class MiniMaxH3TokenRefinerBlock(nn.Module):
             reduce_output=model_config.mapping.tp_size > 1,
         )
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        hidden_states = hidden_states + self.attn(_norm_2d(self.norm1, hidden_states))
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        key_padding_mask: torch.Tensor | None = None,
+        suffix_mask: bool = False,
+    ) -> torch.Tensor:
+        hidden_states = hidden_states + self.attn(
+            _norm_2d(self.norm1, hidden_states),
+            key_padding_mask=key_padding_mask,
+            suffix_mask=suffix_mask,
+        )
         residual = hidden_states
         hidden_states = _norm_2d(self.norm2, hidden_states)
         hidden_states = self.ff(hidden_states.reshape(-1, hidden_states.shape[-1])).reshape_as(
@@ -342,9 +365,14 @@ class MiniMaxH3TokenRefiner(nn.Module):
             has_weights=True,
         )
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, hidden_states: torch.Tensor, key_padding_mask: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        suffix_mask = is_nonempty_suffix_mask(key_padding_mask)
         for block in self.refiner_blocks:
-            hidden_states = block(hidden_states)
+            hidden_states = block(
+                hidden_states, key_padding_mask=key_padding_mask, suffix_mask=suffix_mask
+            )
         return _norm_2d(self.final_norm, hidden_states)
 
 
@@ -401,6 +429,7 @@ class MiniMaxH3TransformerBlock(nn.Module):
         rotary_emb: tuple[torch.Tensor, torch.Tensor],
         key_padding_mask: Optional[torch.Tensor] = None,
         timestep: Optional[torch.Tensor] = None,
+        suffix_mask: bool = False,
     ) -> torch.Tensor:
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaln_proj(temb)
 
@@ -414,6 +443,7 @@ class MiniMaxH3TransformerBlock(nn.Module):
             rotary_emb,
             key_padding_mask,
             timestep,
+            suffix_mask,
         )
 
         residual = hidden_states
@@ -640,14 +670,28 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
         self,
         encoder_hidden_states: torch.Tensor,
         position_ids: torch.Tensor,
+        text_attention_mask: torch.Tensor | None = None,
     ) -> MiniMaxH3StaticContext:
         """Project/refine text and build RoPE once for an entire request."""
 
+        if text_attention_mask is not None:
+            if (
+                text_attention_mask.shape != encoder_hidden_states.shape[:2]
+                or text_attention_mask.dtype != torch.bool
+            ):
+                raise ValueError(
+                    "text_attention_mask must be boolean with shape [batch, text_tokens]."
+                )
+            if not self._supports_key_padding_mask:
+                raise NotImplementedError(
+                    "Batched prompts with padding require key_padding_mask support; use VANILLA."
+                )
         text_embeds = self.context_embedder(encoder_hidden_states.to(self.context_embedder.dtype))
-        text_embeds = self.token_refiner(text_embeds)
+        text_embeds = self.token_refiner(text_embeds, key_padding_mask=text_attention_mask)
         return MiniMaxH3StaticContext(
             text_embeds=text_embeds,
             rotary_emb=self.rope(position_ids),
+            text_attention_mask=text_attention_mask,
         )
 
     def _validate_layout(
@@ -746,7 +790,7 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
         temb = self.time_embedder(temb.to(self.time_embedder.linear_1.weight.dtype))
         adaln_indices = timestep_indices * MINIMAX_H3_MODALITY_NUM + token_tags.clamp(min=0)
         key_padding_mask = None
-        if bool((token_tags < 0).any()):
+        if static_context.text_attention_mask is not None or bool((token_tags < 0).any()):
             if not self._supports_key_padding_mask:
                 raise NotImplementedError(
                     "Padded packed sequences (negative token_tags) need an attention "
@@ -757,7 +801,11 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
             key_padding_mask = (
                 (token_tags >= 0).unsqueeze(0).expand(packed_hidden_states.shape[0], -1)
             )
+            if static_context.text_attention_mask is not None:
+                key_padding_mask = key_padding_mask.clone()
+                key_padding_mask[:, text_indices] &= static_context.text_attention_mask
 
+        suffix_mask = is_nonempty_suffix_mask(key_padding_mask)
         for block in self.transformer_blocks:
             packed_hidden_states = block(
                 packed_hidden_states,
@@ -766,6 +814,7 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
                 static_context.rotary_emb,
                 key_padding_mask,
                 timestep,
+                suffix_mask,
             )
 
         packed_hidden_states = self.norm_out(
