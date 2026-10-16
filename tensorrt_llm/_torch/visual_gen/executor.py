@@ -1,5 +1,9 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import asyncio
 import atexit
+import math
 import os
 import queue
 import socket
@@ -8,9 +12,10 @@ import time
 import traceback
 import weakref
 from collections import deque
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Set, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -20,11 +25,16 @@ import zmq
 from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm._torch.visual_gen.output import PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
+from tensorrt_llm._torch.visual_gen.sleep_control import (
+    _SleepController,
+    _SleepControlRequest,
+    _SleepRequestQueue,
+)
 from tensorrt_llm.bindings.internal import start_coordinator_watchdog
 from tensorrt_llm.executor.ipc import ZeroMqQueue
 from tensorrt_llm.llmapi.utils import configure_cpu_affinity
 from tensorrt_llm.logger import logger
-from tensorrt_llm.visual_gen.args import VisualGenArgs
+from tensorrt_llm.visual_gen.args import SleepPolicy, VisualGenArgs, VisualGenMemoryStatus
 
 if TYPE_CHECKING:
     from tensorrt_llm.visual_gen.params import VisualGenParams
@@ -518,8 +528,12 @@ class DiffusionExecutor:
         try:
             args = self.visual_gen_args
             loader = PipelineLoader(args, device=f"cuda:{self.device_id}")
+            sleep_kwargs = {}
+            if args.sleep_restore_mode is not None:
+                sleep_kwargs["sleep_restore_mode"] = args.sleep_restore_mode
             self.pipeline = loader.load(
                 skip_warmup=args.compilation_config.skip_warmup,
+                **sleep_kwargs,
             )
 
         except Exception as e:
@@ -601,7 +615,7 @@ class DiffusionExecutor:
             req = None
             if self.rank == 0:
                 req = self.requests_ipc.get()
-                if req is not None:
+                if isinstance(req, DiffusionRequest):
                     req.refs_from_shm()
                 logger.info(f"Worker {self.device_id}: Request available")
 
@@ -618,7 +632,32 @@ class DiffusionExecutor:
                 break
 
             logger.info(f"Worker {self.device_id}: Processing request {req.request_id}")
-            self.process_request(req)
+            if isinstance(req, _SleepControlRequest):
+                self._process_sleep_control(req)
+            else:
+                self.process_request(req)
+
+    def _process_sleep_control(self, req: _SleepControlRequest) -> None:
+        """Run sleep/wake after queued generation and report the result."""
+        try:
+            if self.visual_gen_args.sleep_restore_mode is None:
+                raise RuntimeError("Pipeline sleep was not enabled during loading")
+            if self.world_size != 1:
+                raise ValueError("VisualGen sleep/wake currently requires a single GPU")
+            if req.operation == "sleep":
+                self.pipeline.sleep()
+            elif req.operation == "wake_up":
+                self.pipeline.wake_up()
+            else:
+                raise ValueError(f"Unknown sleep/wake operation: {req.operation}")
+            response = DiffusionResponse(
+                request_id=req.request_id, output={"sleeping": self.pipeline.is_sleeping}
+            )
+        except Exception as exc:
+            logger.error(f"Worker {self.device_id}: {req.operation} failed: {exc}")
+            response = DiffusionResponse(request_id=req.request_id, error_msg=str(exc))
+        if self.rank == 0:
+            self.response_queue.put(response)
 
     def _merge_defaults(self, req: DiffusionRequest):
         """Fill ``None`` fields in *req.params* with pipeline-specific defaults.
@@ -880,6 +919,11 @@ class DiffusionRemoteClient:
     ):
         self.args = args
         self.n_workers = args.parallel_config.n_workers
+        self._sleep_controller = None
+        if getattr(args, "sleep_restore_mode", None) is not None:
+            if self.n_workers != 1:
+                raise ValueError("VisualGen sleep/wake currently requires a single GPU")
+            self._sleep_controller = _SleepController()
 
         # --- Detect external launcher (torchrun / srun) ---
         ext = _detect_external_launch()
@@ -918,7 +962,9 @@ class DiffusionRemoteClient:
         # IPC setup
         self.requests_ipc = None
         self.responses_ipc = None
-        self.pending_requests = queue.Queue()
+        self.pending_requests = (
+            _SleepRequestQueue() if self._sleep_controller is not None else queue.Queue()
+        )
         self.completed_responses: Dict[int, DiffusionResponse] = {}
         # Request ids the caller has given up on (e.g., aresult timed out).
         # _store_response drops late-arriving responses for these ids so a
@@ -948,7 +994,7 @@ class DiffusionRemoteClient:
         self._ext_worker_thread: Optional[threading.Thread] = None
         self._monitor_worker_liveness = False
         self._worker_failure: Optional[str] = None
-        self._request_to_send: Optional[DiffusionRequest] = None
+        self._request_to_send: Union[DiffusionRequest, _SleepControlRequest, None] = None
 
         # Start background thread (it will create its own event loop)
         self.background_thread = _Thread(target=self._serve_forever_thread, daemon=True)
@@ -1049,6 +1095,17 @@ class DiffusionRemoteClient:
 
     def enqueue_requests(self, requests: List[DiffusionRequest]) -> List[int]:
         """Enqueue requests and return their IDs."""
+        controller = getattr(self, "_sleep_controller", None)
+        if controller is not None:
+            try:
+                return controller.enqueue(lambda: self._enqueue_requests(requests))
+            except RuntimeError:
+                for request in requests:
+                    self._discard_unsent_request(request)
+                raise
+        return self._enqueue_requests(requests)
+
+    def _enqueue_requests(self, requests: List[DiffusionRequest]) -> List[int]:
         if self._worker_failure is not None:
             raise RuntimeError(self._worker_failure)
 
@@ -1060,8 +1117,119 @@ class DiffusionRemoteClient:
         # queued-request transitions even if the dispatcher drains the queue
         # before the next poll.
         if req_ids:
-            self._iter_stats.record_enqueue(self.pending_requests.qsize())
+            self._iter_stats.record_enqueue(self._num_queued_requests())
         return req_ids
+
+    def _num_queued_requests(self) -> int:
+        if isinstance(self.pending_requests, _SleepRequestQueue):
+            return self.pending_requests.generation_qsize()
+        return self.pending_requests.qsize()
+
+    @property
+    def is_sleeping(self) -> bool:
+        controller = getattr(self, "_sleep_controller", None)
+        return controller is not None and controller.is_sleeping
+
+    def get_memory_status(self) -> VisualGenMemoryStatus:
+        controller = getattr(self, "_sleep_controller", None)
+        if controller is None:
+            raise RuntimeError("Pipeline sleep was not enabled during loading")
+        if self._shutdown_started:
+            raise RuntimeError("VisualGen has been shut down")
+        if self._worker_failure is not None:
+            raise RuntimeError(self._worker_failure)
+        if not self.background_thread.is_alive():
+            raise RuntimeError("VisualGen response loop is not running")
+        states = {
+            "awake": "running",
+            "sleeping": "parking",
+            "asleep": "parked",
+            "waking": "waking",
+            "failed": "failed",
+        }
+        return VisualGenMemoryStatus(state=states[controller.state])
+
+    def sleep(self, *, policy: SleepPolicy = "drain", timeout: Optional[float] = None) -> None:
+        if policy != "drain":
+            raise ValueError("Only the 'drain' sleep policy is supported")
+        self._transition_sleep("sleep", timeout=timeout)
+
+    def wake_up(self, *, timeout: Optional[float] = None) -> None:
+        self._transition_sleep("wake_up", timeout=timeout)
+
+    def _transition_sleep(
+        self, operation: Literal["sleep", "wake_up"], *, timeout: Optional[float] = None
+    ) -> None:
+        if timeout is not None and (
+            isinstance(timeout, bool) or not math.isfinite(timeout) or timeout < 0
+        ):
+            raise ValueError("Sleep/wake timeout must be finite and non-negative, or None")
+        deadline = None if timeout is None else time.monotonic() + timeout
+        controller = getattr(self, "_sleep_controller", None)
+        if controller is None:
+            raise RuntimeError("Pipeline sleep was not enabled during loading")
+        if threading.current_thread() is self.background_thread:
+            raise RuntimeError("Cannot block the VisualGen response loop on sleep/wake")
+        if self._shutdown_started:
+            raise RuntimeError("VisualGen has been shut down")
+        if self._worker_failure is not None:
+            raise RuntimeError(self._worker_failure)
+        controller.transition(
+            operation,
+            lambda request: self._send_sleep_control(request, deadline=deadline),
+            deadline=deadline,
+        )
+
+    def _send_sleep_control(
+        self, request: _SleepControlRequest, *, deadline: Optional[float] = None
+    ) -> None:
+        if self._worker_failure is not None:
+            raise RuntimeError(self._worker_failure)
+        self.pending_requests.put(request)
+        future = None
+        received = False
+        try:
+            waiter = self.await_responses(request.request_id)
+            try:
+                future = asyncio.run_coroutine_threadsafe(waiter, self._event_loop)
+            except RuntimeError:
+                waiter.close()
+                raise
+            while True:
+                if self._shutdown_started or not self.background_thread.is_alive():
+                    raise RuntimeError("VisualGen shut down while waiting for sleep/wake")
+                wait_time = AWAIT_TIMEOUT
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError(
+                            f"VisualGen {request.operation} timed out; recreate the instance "
+                            "(restart the process for external launch) before generating again"
+                        )
+                    wait_time = min(wait_time, remaining)
+                try:
+                    response = future.result(timeout=wait_time)
+                except FutureTimeoutError:
+                    if not future.done():
+                        continue
+                    response = future.result()
+                received = True
+                break
+            if response.error_msg is not None:
+                raise RuntimeError(f"VisualGen {request.operation} failed: {response.error_msg}")
+            if response.output != {"sleeping": request.operation == "sleep"}:
+                raise RuntimeError("Worker did not acknowledge the requested sleep/wake state")
+        finally:
+            if not received:
+                try:
+                    self._event_loop.call_soon_threadsafe(
+                        lambda: asyncio.create_task(self.abandon_request_id(request.request_id))
+                    )
+                except RuntimeError:
+                    if not self._event_loop.is_closed():
+                        raise
+            if future is not None and not future.done():
+                future.cancel()
 
     async def await_responses(
         self, request_ids: Union[int, List[int]], timeout: Optional[float] = None
@@ -1178,8 +1346,10 @@ class DiffusionRemoteClient:
                 self._close_socket(self.requests_ipc)
 
     @staticmethod
-    def _discard_unsent_request(request: Optional[DiffusionRequest]) -> None:
-        if request is None:
+    def _discard_unsent_request(
+        request: Union[DiffusionRequest, _SleepControlRequest, None],
+    ) -> None:
+        if request is None or isinstance(request, _SleepControlRequest):
             return
         try:
             # Rebuilding an unsent shared-memory handle releases its producer
@@ -1208,7 +1378,8 @@ class DiffusionRemoteClient:
             self._request_to_send = None
             # Once the request has been handed to the workers it becomes the
             # in-flight ("active") request from the client's perspective.
-            self._iter_stats.record_request_started(req.request_id, self.pending_requests.qsize())
+            if req.request_id >= 0:
+                self._iter_stats.record_request_started(req.request_id, self._num_queued_requests())
         except queue.Empty:
             pass
         except zmq.Again:
@@ -1222,6 +1393,11 @@ class DiffusionRemoteClient:
             self._request_to_send = None
             logger.error(f"DiffusionClient: Error sending request: {e}")
             logger.error(traceback.format_exc())
+            if isinstance(req, _SleepControlRequest):
+                asyncio.run_coroutine_threadsafe(
+                    self._store_response(DiffusionResponse(req.request_id, error_msg=str(e))),
+                    self._event_loop,
+                )
 
     def _process_responses(self):
         """Poll and process responses."""
@@ -1254,18 +1430,18 @@ class DiffusionRemoteClient:
                 self._abandoned_request_ids.discard(response.request_id)
                 # The request was abandoned — still mark it complete in the
                 # iteration-stats so ``numActiveRequests`` decrements.
-                if response.request_id != -1:
+                if response.request_id >= 0:
                     self._iter_stats.record_request_completed(
-                        response.request_id, self.pending_requests.qsize()
+                        response.request_id, self._num_queued_requests()
                     )
                 return
             self.completed_responses[response.request_id] = response
         # Record completion outside the asyncio lock to avoid blocking the
-        # event loop on the (uncontended) tracker mutex.  The READY signal
-        # uses request_id == -1 and is not tracked as a real request.
-        if response.request_id != -1:
+        # event loop on the (uncontended) tracker mutex. READY and lifecycle
+        # responses have negative IDs and are not generation requests.
+        if response.request_id >= 0:
             self._iter_stats.record_request_completed(
-                response.request_id, self.pending_requests.qsize()
+                response.request_id, self._num_queued_requests()
             )
         self.response_event.set()
 
@@ -1283,7 +1459,7 @@ class DiffusionRemoteClient:
 
     def get_current_iteration_snapshot(self) -> Dict:
         """Return a single snapshot of the current state (no buffering)."""
-        return self._iter_stats.current_snapshot(self.pending_requests.qsize())
+        return self._iter_stats.current_snapshot(self._num_queued_requests())
 
     async def abandon_request_id(self, request_id: int):
         """Mark a request id as abandoned and drop any cached response.
@@ -1417,6 +1593,9 @@ class DiffusionRemoteClient:
             with self._shutdown_lock:
                 if not self._shutdown_started:
                     self._shutdown_started = True
+                    controller = getattr(self, "_sleep_controller", None)
+                    if controller is not None:
+                        controller.close()
                     self._shutdown_error = None
                     self._shutdown_thread = _Thread(
                         target=self._perform_shutdown,

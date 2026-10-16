@@ -28,7 +28,7 @@ from tensorrt_llm._torch.visual_gen.executor import (
 from tensorrt_llm._torch.visual_gen.output import split_visual_gen_output, to_visual_gen_output
 from tensorrt_llm._torch.visual_gen.pipeline import ExtraParamSchema, RefSlotSpec
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PIPELINE_REGISTRY, AutoPipeline
-from tensorrt_llm.visual_gen.args import VisualGenArgs
+from tensorrt_llm.visual_gen.args import SleepPolicy, VisualGenArgs, VisualGenMemoryStatus
 from tensorrt_llm.visual_gen.output import VisualGenOutput
 from tensorrt_llm.visual_gen.params import (
     VisualGenParams,
@@ -457,6 +457,56 @@ class VisualGen:
 
     def __enter__(self):
         return self
+
+    @set_api_status("prototype")
+    def release(self, *, policy: SleepPolicy = "drain", timeout: Optional[float] = None) -> None:
+        """Reject new requests, finish accepted work, and offload managed GPU memory.
+
+        Requires ``sleep_restore_mode="CPU"`` or ``"PINNED"``. This call blocks;
+        async callers can use ``asyncio.to_thread``.
+
+        Args:
+            policy: Only "drain" is supported: finish all accepted requests before release.
+            timeout: Seconds to wait, including queued work and other transitions.
+                None waits indefinitely. Expiry after submission blocks generation
+                until restart; it does not cancel worker execution. Recreate the
+                instance, or restart the process for external launch.
+        """
+        executor = self.executor
+        if executor is None:
+            raise RuntimeError("VisualGen has been shut down")
+        executor.sleep(policy=policy, timeout=timeout)
+
+    @set_api_status("prototype")
+    def resume(self, *, timeout: Optional[float] = None) -> None:
+        """Restore managed GPU memory and allow generation again.
+
+        Waits for this instance's current transition.
+
+        Args:
+            timeout: Seconds to wait, including other transitions. None waits
+                indefinitely. Expiry after submission blocks generation until
+                restart; it does not cancel worker execution. Recreate the
+                instance, or restart the process for external launch.
+        """
+        executor = self.executor
+        if executor is None:
+            raise RuntimeError("VisualGen has been shut down")
+        executor.wake_up(timeout=timeout)
+
+    @set_api_status("prototype")
+    def get_memory_status(self) -> VisualGenMemoryStatus:
+        """Return this instance's runtime-memory admission state.
+
+        States match the LLM API: running, parking, parked, waking, failed.
+        Running and parked require worker acknowledgment. This snapshot does
+        not wait for a transition or inspect physical memory usage. Requires
+        sleep to be enabled; raises after shutdown or detected worker failure.
+        """
+        executor = self.executor
+        if executor is None:
+            raise RuntimeError("VisualGen has been shut down")
+        return executor.get_memory_status()
 
     def __exit__(self, exc_type, exc_value, traceback) -> Literal[False]:
         del exc_value, traceback

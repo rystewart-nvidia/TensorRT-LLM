@@ -56,6 +56,7 @@ if TYPE_CHECKING:
         VAEConfig,
         VideoSparseAttentionConfig,
         VisualGenArgs,
+        VisualGenMemoryStatus,
     )
     from .output import VisualGenMetrics, VisualGenOutput
     from .params import MediaRef, VisualGenParams
@@ -67,6 +68,7 @@ _LAZY_ATTRS = {
     "VisualGenResult": "tensorrt_llm.visual_gen.visual_gen",
     "ExtraParamSchema": "tensorrt_llm.visual_gen.visual_gen",
     "VisualGenArgs": "tensorrt_llm.visual_gen.args",
+    "VisualGenMemoryStatus": "tensorrt_llm.visual_gen.args",
     "AttentionConfig": "tensorrt_llm.visual_gen.args",
     "CacheConfig": "tensorrt_llm.visual_gen.args",
     "CacheDiTConfig": "tensorrt_llm.visual_gen.args",
@@ -124,7 +126,8 @@ __all__ = [
     "VisualGenOutput",
     "VisualGenMetrics",
     "ExtraParamSchema",
-    # Cross-cutting sub-configs
+    # Cross-cutting types and sub-configs
+    "VisualGenMemoryStatus",
     "CompilationConfig",
     "CudaGraphConfig",
     "CpuOffloadConfig",

@@ -18,14 +18,13 @@
 from collections.abc import Iterator
 from contextlib import contextmanager
 from threading import Condition, Lock, get_ident
-from typing import Literal, TypeAlias
+from typing import Literal
 from uuid import uuid4
 
 import torch
 
 from tensorrt_llm._torch import virtual_memory
-
-SleepRestoreMode: TypeAlias = Literal["CPU", "PINNED"]
+from tensorrt_llm.visual_gen.args import SleepRestoreMode
 
 
 class PipelineSleepManager:

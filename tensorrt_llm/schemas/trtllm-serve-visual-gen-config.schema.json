@@ -1076,6 +1076,24 @@
       "description": "Startup-preloaded LoRA adapter fused into VisualGen transformer weights.",
       "status": "prototype"
     },
+    "sleep_restore_mode": {
+      "anyOf": [
+        {
+          "enum": [
+            "CPU",
+            "PINNED"
+          ],
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Back idle GPU allocations in CPU or pinned host memory for sleep/wake; None disables sleep. Currently supported only by single-GPU MiniMax-H3.",
+      "status": "prototype",
+      "title": "Sleep Restore Mode"
+    },
     "torch_compile_config": {
       "$ref": "#/$defs/TorchCompileConfig",
       "status": "prototype"

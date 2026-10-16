@@ -42,6 +42,19 @@ from .sparse_attention import (
 # =============================================================================
 
 CacheBackendName = Literal["teacache", "cache_dit"]
+SleepRestoreMode = Literal["CPU", "PINNED"]
+SleepPolicy = Literal["drain"]
+
+
+@set_api_status("prototype")
+class VisualGenMemoryStatus(StrictBaseModel):
+    """Snapshot of VisualGen's runtime-memory admission state."""
+
+    state: Literal["running", "parking", "parked", "waking", "failed"] = Field(
+        status="prototype",
+        description="Current runtime-memory admission state.",
+    )
+
 
 # =============================================================================
 # Sub-configuration classes for VisualGenArgs
@@ -827,6 +840,15 @@ class VisualGenArgs(StrictBaseModel):
         description=("Startup-preloaded LoRA adapter fused into VisualGen transformer weights."),
     )
 
+    sleep_restore_mode: Optional[SleepRestoreMode] = Field(
+        None,
+        status="prototype",
+        description=(
+            "Back idle GPU allocations in CPU or pinned host memory for sleep/wake; "
+            "None disables sleep. Currently supported only by single-GPU MiniMax-H3."
+        ),
+    )
+
     pipeline_config: Dict[str, Any] = Field(
         default_factory=dict,
         status="prototype",
@@ -923,4 +945,5 @@ __all__ = [
     "CompilationConfig",
     "RuntimeLoRAConfig",
     "VisualGenArgs",
+    "VisualGenMemoryStatus",
 ]

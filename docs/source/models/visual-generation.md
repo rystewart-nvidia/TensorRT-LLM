@@ -415,10 +415,28 @@ from disk. An idle MiniMax-H3 pipeline backs its persistent GPU allocations in
 host RAM and releases their GPU memory. Wake restores them at their original
 addresses without reloading or requantizing the checkpoint.
 
-This feature is disabled by default and available only through the internal,
-single-GPU H3 pipeline. Support for other VisualGen models may be added in the
-future. It is not exposed through public `VisualGen`, HTTP, or Dynamo controls.
-Enable it explicitly during loading:
+This feature is disabled by default and currently supports only single-GPU H3.
+Support for other VisualGen models may be added in the future. Enable it at
+startup to use the public Python controls:
+
+```python
+from tensorrt_llm import VisualGen, VisualGenArgs
+
+args = VisualGenArgs(
+    sleep_restore_mode="PINNED",
+    quant_config={"quant_algo": "FP8_BLOCK_SCALES", "dynamic": True},
+    cuda_graph_config={"enable": False},
+)
+with VisualGen("MiniMaxAI/MiniMax-H3", args=args) as model:
+    model.release(policy="drain", timeout=300)
+    assert model.get_memory_status().state == "parked"
+    model.resume(timeout=60)
+    assert model.get_memory_status().state == "running"
+```
+
+The same opt-in configuration is accepted in `--visual_gen_args` YAML, but HTTP
+lifecycle endpoints and Dynamo integration are not included. The internal loader
+continues to support explicit opt-in:
 
 ```python
 pipeline = PipelineLoader(args).load(sleep_restore_mode="PINNED")
@@ -432,11 +450,38 @@ each instance's captured allocation pool, which can include cached loading and
 quantization buffers in addition to weights. This is process-local offload:
 the process, CUDA context, host memory, and node must remain alive.
 
-Sleep rejects new generation and waits for the active call to finish before
-releasing memory. Sleep/wake transitions are serialized per instance; overlapping
-generation calls are rejected rather than queued. A failed transition prevents
-further generation and requires restarting the worker. Callers manage external
-request queues and must not access model tensors directly during transitions.
+Public `release()` supports only `policy="drain"` (the default): it closes admission,
+finishes all generation requests already accepted by that instance, and waits for
+the worker to finish offloading. It does not preempt inference, bypass queued
+requests, or hold them until wake; other policy values are rejected. New generation
+is rejected during sleep/wake and while asleep; callers must explicitly wake the
+instance before submitting more work. The internal direct pipeline waits only
+for its active generation call and does not manage external request queues.
+The public names match the LLM API's `release()`, `resume()`, and
+`get_memory_status()`; the internal
+pipeline still uses `sleep()` / `wake_up()`. VisualGen releases the whole captured
+pipeline pool, not individual LLM memory tags.
+`get_memory_status().state` uses the same lifecycle names as the LLM API:
+`running`, `parking`, `parked`, `waking`, and `failed`. It returns an admission-state
+snapshot without waiting for an in-progress transition; `parking` includes draining
+accepted generation. `parked` and restored `running` require worker acknowledgment.
+Status queries require sleep to be enabled and raise after shutdown, detected worker
+failure, or a stopped response loop. They do not inspect physical memory usage.
+`release()` and `resume()` run one at a time per instance and wait until finished.
+`get_memory_status()` reports the current state without waiting for them.
+For release and resume,
+async applications can use `asyncio.to_thread(model.release)` and
+`asyncio.to_thread(model.resume)`. A failed transition prevents further generation
+and requires restarting the worker. Do not access model tensors directly during
+transitions.
+Public `release()` and `resume()` accept an optional `timeout` in seconds. It
+covers other transitions, queued generation, and the worker's reply. The default `None`
+waits indefinitely. A timeout before submission leaves the current transition
+alone. After submission, a timeout blocks further generation and requires
+shutting down and recreating the `VisualGen` instance. Under external launch
+(`torchrun`/`srun`), restart the process instead because rank 0's model worker
+runs in a thread. A timeout does not cancel the worker's operation, and late
+replies do not make the instance usable again.
 Warmup and inference allocations are outside the captured pool; live outputs and
 the CUDA context remain on the GPU, so sleep does not reduce GPU usage to zero.
 
@@ -452,6 +497,8 @@ audio, and parameter addresses. Full-model sleep coverage is FP8 text-to-video/a
 with pinned backing; keyframe-conditioned, Ref2VA, and non-FP8 sleep configurations remain
 unvalidated. The checkpoint-backed regression is
 `tests/integration/defs/visual_gen/test_minimax_h3_sleep.py`.
+Public worker-queue coverage is in
+`tests/integration/defs/visual_gen/test_visual_gen_sleep.py`.
 
 ## Developer Guide
 
